@@ -1,0 +1,31 @@
+name: Trigger GripoFlow Gitleaks Scan
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  trigger-gripoflow:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger GripoFlow webhook
+        env:
+          GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
+        run: |
+          curl -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "ref": "${{ github.ref }}",
+              "repository": {
+                "name": "${{ github.event.repository.name }}",
+                "clone_url": "${{ github.event.repository.clone_url }}"
+              },
+              "pusher": {
+                "name": "${{ github.actor }}"
+              },
+              "head_commit": {
+                "id": "${{ github.sha }}"
+              }
+            }'
