@@ -12,3 +12,4 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
 # scan test
 # scan test
 # trigger scan
+# trigger scan
