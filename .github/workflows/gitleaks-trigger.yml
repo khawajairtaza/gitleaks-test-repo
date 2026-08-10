@@ -13,7 +13,6 @@ jobs:
       - name: Trigger GripoFlow webhook
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
-          GITHUB_TOKEN_FOR_SCAN: ${{ secrets.GITHUB_TOKEN_FOR_SCAN }}
         run: |
           curl -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
@@ -28,6 +27,5 @@ jobs:
               },
               "head_commit": {
                 "id": "${{ github.sha }}"
-              },
-              "github_token": "'"$GITHUB_TOKEN_FOR_SCAN"'"
+              }
             }'
