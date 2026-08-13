@@ -1,20 +1,28 @@
-name: Trigger GripoFlow Gitleaks Scan
+name: GripoFlow Secret Scan
 
 on:
   push:
     branches:
       - main
 
+permissions:
+  contents: read
+  statuses: write
+
 jobs:
-  trigger-gripoflow:
+  security-scan:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger GripoFlow webhook
+      - name: Send push to GripoFlow
+        id: gripoflow
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
         run: |
-          curl -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+          set -e
+
+          RESPONSE=$(curl -sS \
+            -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d '{
               "ref": "${{ github.ref }}",
@@ -23,9 +31,37 @@ jobs:
                 "clone_url": "${{ github.event.repository.clone_url }}"
               },
               "pusher": {
-                "name": "${{ github.actor }}"
+                "name": "${{ github.repository_owner }}"
               },
               "head_commit": {
                 "id": "${{ github.sha }}"
               }
-            }'
+            }')
+
+          echo "GripoFlow response:"
+          echo "$RESPONSE"
+
+          echo "result=$RESPONSE" >> "$GITHUB_OUTPUT"
+
+      - name: Update GitHub commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RESULT='${{ steps.gripoflow.outputs.result }}'
+
+          if echo "$RESULT" | grep -q '"status"[[:space:]]*:[[:space:]]*"failure"'; then
+            STATE="failure"
+            DESCRIPTION="Secrets detected by GripoFlow/Gitleaks"
+          else
+            STATE="success"
+            DESCRIPTION="No secrets detected by GripoFlow/Gitleaks"
+          fi
+
+          curl -sS -L \
+            -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"state":"%s","description":"%s","context":"GripoFlow Gitleaks Scan"}' "$STATE" "$DESCRIPTION")"
