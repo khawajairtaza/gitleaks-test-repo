@@ -1,67 +1,51 @@
-name: GripoFlow Secret Scan
+name: PR Secret Leakage Gate
 
 on:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-  statuses: write
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 jobs:
-  security-scan:
+  gitleaks-scan:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Send push to GripoFlow
-        id: gripoflow
+      - name: Scan PR via GripoFlow and enforce result
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
         run: |
-          set -e
+          PAYLOAD=$(cat <<EOF
+          {
+            "repository": {
+              "clone_url": "${{ github.event.repository.clone_url }}",
+              "full_name": "${{ github.repository }}"
+            },
+            "pull_request": {
+              "number": ${{ github.event.pull_request.number }},
+              "head_sha": "${{ github.event.pull_request.head.sha }}",
+              "head_ref": "${{ github.event.pull_request.head.ref }}",
+              "base_ref": "${{ github.event.pull_request.base.ref }}"
+            }
+          }
+          EOF
+          )
 
-          RESPONSE=$(curl -sS \
-            -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d '{
-              "ref": "${{ github.ref }}",
-              "repository": {
-                "name": "${{ github.event.repository.name }}",
-                "clone_url": "${{ github.event.repository.clone_url }}"
-              },
-              "pusher": {
-                "name": "${{ github.repository_owner }}"
-              },
-              "head_commit": {
-                "id": "${{ github.sha }}"
-              }
-            }')
+            -d "$PAYLOAD")
 
-          echo "GripoFlow response:"
-          echo "$RESPONSE"
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
-          echo "result=$RESPONSE" >> "$GITHUB_OUTPUT"
+          echo "GripoFlow response ($HTTP_CODE):"
+          echo "$BODY"
 
-      - name: Update GitHub commit status
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RESULT='${{ steps.gripoflow.outputs.result }}'
+          STATUS=$(echo "$BODY" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')
 
-          if echo "$RESULT" | grep -q '"status"[[:space:]]*:[[:space:]]*"failure"'; then
-            STATE="failure"
-            DESCRIPTION="Secrets detected by GripoFlow/Gitleaks"
-          else
-            STATE="success"
-            DESCRIPTION="No secrets detected by GripoFlow/Gitleaks"
+          if [ "$STATUS" = "failure" ]; then
+            echo "::error::Gitleaks detected secrets in this PR. Merge blocked."
+            exit 1
+          elif [ "$STATUS" != "success" ]; then
+            echo "::error::Unexpected or missing response from GripoFlow — treating as failure."
+            exit 1
           fi
 
-          curl -sS -L \
-            -X POST \
-            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            -H "Content-Type: application/json" \
-            -d "$(printf '{"state":"%s","description":"%s","context":"GripoFlow Gitleaks Scan"}' "$STATE" "$DESCRIPTION")"
+          echo "No secrets detected. PR clear to merge."
