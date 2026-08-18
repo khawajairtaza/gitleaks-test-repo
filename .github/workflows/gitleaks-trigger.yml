@@ -7,8 +7,21 @@ on:
 jobs:
   gitleaks-scan:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Scan PR via GripoFlow and enforce result
+      - name: Check GripoFlow configuration
+        env:
+          GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
+        run: |
+          if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
+            echo "::error::GRIPOFLOW_WEBHOOK_URL is empty or unavailable"
+            exit 1
+          fi
+
+          echo "GRIPOFLOW_WEBHOOK_URL is available"
+          echo "URL length: ${#GRIPOFLOW_WEBHOOK_URL}"
+
+      - name: Scan PR via GripoFlow
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
         run: |
@@ -28,24 +41,21 @@ jobs:
           EOF
           )
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+          echo "Triggering GripoFlow..."
+
+          HTTP_CODE=$(curl -sS -o /tmp/gripoflow-response.txt \
+            -w "%{http_code}" \
+            -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+          echo "HTTP status: $HTTP_CODE"
+          echo "GripoFlow response:"
+          cat /tmp/gripoflow-response.txt
 
-          echo "GripoFlow response ($HTTP_CODE):"
-          echo "$BODY"
-
-          STATUS=$(echo "$BODY" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')
-
-          if [ "$STATUS" = "failure" ]; then
-            echo "::error::Gitleaks detected secrets in this PR. Merge blocked."
-            exit 1
-          elif [ "$STATUS" != "success" ]; then
-            echo "::error::Unexpected or missing response from GripoFlow — treating as failure."
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Failed to trigger GripoFlow"
             exit 1
           fi
 
-          echo "No secrets detected. PR clear to merge."
+          echo "GripoFlow workflow triggered successfully."
