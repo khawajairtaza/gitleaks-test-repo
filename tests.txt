@@ -1,20 +1,8 @@
-# Gitleaks test secrets
-# These are intentionally fake/test values for scanner testing only.
-
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-
-SLACK_BOT_TOKEN=xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx
-GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz
-
-DB_PASSWORD=TestOnly-DoNotUse-123456!
-STRIPE_SECRET_KEY=sk_test_4eC39HqLyjWDarjtT1zdp7dc
-GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz
-
-DB_PASSWORD=TestOnly-DoNotUse-123456!
-PRIVATE_KEY_TEST=-----BEGIN RSA PRIVATE KEY-----
-MIIEpAIBAAKCAQEAEXAMPLEONLYTESTVALUE
 -----END RSA PRIVATE KEY-----
 -----END RSA PRIVATE KEY-----
 -----END RSA PRIVATE KEY-----
 
+
+
+
+THIS IS JUST THE TEST FILE :)
