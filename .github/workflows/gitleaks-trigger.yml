@@ -9,33 +9,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check GripoFlow configuration
+      - name: Trigger GripoFlow
+        id: trigger
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
         run: |
+          set -e
+
           if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
-            echo "::error::GRIPOFLOW_WEBHOOK_URL is empty or unavailable"
+            echo "GRIPOFLOW_WEBHOOK_URL is not configured."
             exit 1
           fi
 
-          echo "GRIPOFLOW_WEBHOOK_URL is available"
-          echo "URL length: ${#GRIPOFLOW_WEBHOOK_URL}"
-
-      - name: Scan PR via GripoFlow
-        env:
-          GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
-        run: |
           PAYLOAD=$(cat <<EOF
           {
+            "pull_request": {
+              "number": ${{ github.event.pull_request.number }},
+              "base_ref": "${{ github.event.pull_request.base.ref }}",
+              "head_ref": "${{ github.event.pull_request.head.ref }}",
+              "head_sha": "${{ github.event.pull_request.head.sha }}"
+            },
             "repository": {
               "clone_url": "${{ github.event.repository.clone_url }}",
               "full_name": "${{ github.repository }}"
-            },
-            "pull_request": {
-              "number": ${{ github.event.pull_request.number }},
-              "head_sha": "${{ github.event.pull_request.head.sha }}",
-              "head_ref": "${{ github.event.pull_request.head.ref }}",
-              "base_ref": "${{ github.event.pull_request.base.ref }}"
             }
           }
           EOF
@@ -43,19 +39,250 @@ jobs:
 
           echo "Triggering GripoFlow..."
 
-          HTTP_CODE=$(curl -sS -o /tmp/gripoflow-response.txt \
+          HTTP_STATUS=$(curl -sS \
+            -o /tmp/gripoflow-response.json \
             -w "%{http_code}" \
-            -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+            -X POST \
+            "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
-          echo "HTTP status: $HTTP_CODE"
+          echo "HTTP status: $HTTP_STATUS"
           echo "GripoFlow response:"
-          cat /tmp/gripoflow-response.txt
+          cat /tmp/gripoflow-response.json
+          echo
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Failed to trigger GripoFlow"
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Failed to trigger GripoFlow."
             exit 1
           fi
 
-          echo "GripoFlow workflow triggered successfully."
+          echo "GripoFlow webhook accepted the request."
+
+      - name: Wait for GripoFlow scan result
+        env:
+          GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
+        run: |
+          set -e
+
+          # Extract the GripoFlow base URL from the webhook URL.
+          #
+          # Example:
+          # https://example.ngrok-free.dev/api/v1/inbound/webhook/WORKFLOW-ID/gitleaks-scan
+          #
+          # becomes:
+          # https://example.ngrok-free.dev
+          GRIPOFLOW_BASE_URL=$(echo "$GRIPOFLOW_WEBHOOK_URL" | sed -E 's#(https?://[^/]+).*#\1#')
+
+          # Your current GripoFlow workflow ID.
+          WORKFLOW_ID="0a473e7c-23eb-4515-8af7-4be17d70a73b"
+
+          EXECUTIONS_URL="$GRIPOFLOW_BASE_URL/api/v1/workflow/$WORKFLOW_ID/execution/"
+          EVENTS_BASE_URL="$GRIPOFLOW_BASE_URL/api/v1/workflow/$WORKFLOW_ID/execution"
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          echo "Waiting for GripoFlow execution..."
+          echo "PR: $PR_NUMBER"
+          echo "HEAD SHA: $HEAD_SHA"
+
+          EXECUTION_ID=""
+
+          # ---------------------------------------------------------
+          # STEP 1:
+          # Find the execution created for this PR/head SHA.
+          # ---------------------------------------------------------
+
+          for i in {1..30}; do
+            echo "Checking GripoFlow executions... attempt $i/30"
+
+            EXECUTIONS=$(curl -sS "$EXECUTIONS_URL")
+
+            # Look for the execution containing our HEAD SHA.
+            EXECUTION_ID=$(echo "$EXECUTIONS" | python3 -c '
+          import sys
+          import json
+
+          data = json.load(sys.stdin)
+
+          target_sha = sys.argv[1]
+          target_pr = sys.argv[2]
+
+          executions = data.get("data", [])
+
+          # Newest executions are normally at the end.
+          for execution in reversed(executions):
+              payload = execution.get("trigger", {}).get("payload", {})
+              pr = payload.get("pull_request", {})
+              sha = pr.get("head_sha")
+              number = str(pr.get("number", ""))
+
+              if sha == target_sha and number == target_pr:
+                  print(execution.get("id", ""))
+                  break
+          ' "$HEAD_SHA" "$PR_NUMBER")
+
+            if [ -n "$EXECUTION_ID" ]; then
+              echo "Found GripoFlow execution:"
+              echo "$EXECUTION_ID"
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$EXECUTION_ID" ]; then
+            echo "ERROR: Could not find the GripoFlow execution."
+            exit 1
+          fi
+
+          echo
+          echo "Monitoring execution: $EXECUTION_ID"
+          echo
+
+          # ---------------------------------------------------------
+          # STEP 2:
+          # Poll the execution events until GripoFlow completes.
+          # ---------------------------------------------------------
+
+          SCAN_STATUS=""
+
+          for i in {1..60}; do
+            echo "Polling GripoFlow... attempt $i/60"
+
+            EVENTS_URL="$EVENTS_BASE_URL/$EXECUTION_ID/event"
+
+            EVENTS=$(curl -sS "$EVENTS_URL")
+
+            # Save the complete event stream for debugging.
+            echo "$EVENTS" > /tmp/gripoflow-events.txt
+
+            # Check whether workflow itself completed.
+            WORKFLOW_STATUS=$(echo "$EVENTS" | python3 -c '
+          import sys
+          import json
+
+          status = ""
+
+          for line in sys.stdin:
+              line = line.strip()
+
+              if not line.startswith("data:"):
+                  continue
+
+              try:
+                  event = json.loads(line[5:].strip())
+
+                  if event.get("type") == "workflow":
+                      status = event.get("status", "")
+              except:
+                  pass
+
+          print(status)
+          ')
+
+            echo "Workflow status: $WORKFLOW_STATUS"
+
+            # -------------------------------------------------------
+            # Look for the A1 output.
+            # -------------------------------------------------------
+
+            RESULT=$(echo "$EVENTS" | python3 -c '
+          import sys
+          import json
+
+          for line in sys.stdin:
+              line = line.strip()
+
+              if not line.startswith("data:"):
+                  continue
+
+              try:
+                  event = json.loads(line[5:].strip())
+
+                  # A1 is the Gitleaks scanner.
+                  if event.get("type") == "activity":
+                      if event.get("meta", {}).get("activityId") == "A1":
+                          if event.get("status") == "completed":
+                              output = event.get("output", {})
+                              result = output.get("output", "")
+
+                              if result:
+                                  print(result)
+                                  break
+              except Exception:
+                  pass
+          ')
+
+            if [ -n "$RESULT" ]; then
+              echo
+              echo "========================================"
+              echo "GripoFlow Gitleaks Result"
+              echo "========================================"
+              echo "$RESULT"
+              echo "========================================"
+              echo
+
+              # Extract security status.
+              SCAN_STATUS=$(echo "$RESULT" | python3 -c '
+          import sys
+          import json
+
+          text = sys.stdin.read()
+
+          # A1 currently prefixes the JSON with:
+          # "Downloading repository..."
+          #
+          # Find the JSON object inside the output.
+          start = text.find("{")
+          end = text.rfind("}")
+
+          if start >= 0 and end >= start:
+              try:
+                  data = json.loads(text[start:end+1])
+                  print(data.get("status", ""))
+              except:
+                  pass
+          ')
+
+              echo "Security scan status: $SCAN_STATUS"
+
+              if [ "$SCAN_STATUS" = "failure" ]; then
+                echo
+                echo "========================================"
+                echo "SECURITY SCAN FAILED"
+                echo "Secrets were detected by Gitleaks."
+                echo "This pull request must not be merged."
+                echo "========================================"
+                exit 1
+              fi
+
+              if [ "$SCAN_STATUS" = "success" ]; then
+                echo
+                echo "========================================"
+                echo "SECURITY SCAN PASSED"
+                echo "No secrets detected."
+                echo "========================================"
+                exit 0
+              fi
+            fi
+
+            # If workflow completed but we still couldn't determine
+            # the scan result, fail closed.
+            if [ "$WORKFLOW_STATUS" = "completed" ]; then
+              echo "GripoFlow completed but no valid security result was found."
+              echo "Failing the GitHub check for safety."
+              exit 1
+            fi
+
+            if [ "$WORKFLOW_STATUS" = "failed" ]; then
+              echo "GripoFlow workflow failed."
+              exit 1
+            fi
+
+            sleep 3
+          done
+
+          echo "ERROR: Timed out waiting for GripoFlow."
+          exit 1
