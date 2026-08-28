@@ -14,12 +14,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Scan PR via GripoFlow and enforce result
+      - name: Scan PR via GripoFlow
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
-          GRIPOFLOW_API_URL: ${{ secrets.GRIPOFLOW_API_URL }}
-          GRIPOFLOW_API_TOKEN: ${{ secrets.GRIPOFLOW_API_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
         run: |
           set -e
@@ -42,54 +39,54 @@ jobs:
           echo "Repository: $REPO_FULL_NAME"
 
           # ==================================================
-          # 1. Build PR payload
+          # Build PR payload
           # ==================================================
 
-          PAYLOAD=$(cat <<EOF
-          {
-            "repository": {
-              "clone_url": "$REPO_URL",
-              "full_name": "$REPO_FULL_NAME"
-            },
-            "pull_request": {
-              "number": $PR_NUMBER,
-              "head_sha": "$HEAD_SHA",
-              "head_ref": "$HEAD_REF",
-              "base_ref": "$BASE_REF"
-            }
-          }
-          EOF
+          PAYLOAD=$(jq -n \
+            --arg clone_url "$REPO_URL" \
+            --arg full_name "$REPO_FULL_NAME" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg head_ref "$HEAD_REF" \
+            --arg base_ref "$BASE_REF" \
+            --argjson number "$PR_NUMBER" \
+            '{
+              repository: {
+                clone_url: $clone_url,
+                full_name: $full_name
+              },
+              pull_request: {
+                number: $number,
+                head_sha: $head_sha,
+                head_ref: $head_ref,
+                base_ref: $base_ref
+              }
+            }'
           )
 
           echo ""
           echo "PR payload created."
 
           # ==================================================
-          # 2. Validate GripoFlow webhook configuration
+          # Validate webhook
           # ==================================================
 
-          echo ""
-          echo "Checking GripoFlow webhook configuration..."
-
           if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
-            echo "::error::GRIPOFLOW_WEBHOOK_URL is empty or not configured."
+            echo "::error::GRIPOFLOW_WEBHOOK_URL is not configured."
             exit 1
           fi
 
           echo "Webhook URL is configured."
 
           # ==================================================
-          # 3. Send PR data to GripoFlow
+          # Send request to GripoFlow
           # ==================================================
 
           echo ""
           echo "Sending PR data to GripoFlow..."
 
-          set +e
-
           RESPONSE=$(curl -sS \
             --connect-timeout 15 \
-            --max-time 60 \
+            --max-time 300 \
             -w "\n%{http_code}" \
             -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
@@ -98,10 +95,8 @@ jobs:
 
           CURL_EXIT=$?
 
-          set -e
-
           if [ "$CURL_EXIT" -ne 0 ]; then
-            echo "::error::curl failed while contacting GripoFlow."
+            echo "::error::Failed to contact GripoFlow."
             echo "curl exit code: $CURL_EXIT"
             exit 1
           fi
@@ -109,189 +104,57 @@ jobs:
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
 
+          echo ""
           echo "GripoFlow HTTP status: $HTTP_CODE"
           echo "GripoFlow response:"
           echo "$BODY"
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::error::GripoFlow webhook returned HTTP $HTTP_CODE."
-            exit 1
-          fi
-
-          echo ""
-          echo "GripoFlow accepted the webhook request."
-
           # ==================================================
-          # 4. Validate API configuration
+          # Validate HTTP response
           # ==================================================
 
-          echo ""
-          echo "Checking GripoFlow API configuration..."
-
-          if [ -z "$GRIPOFLOW_API_URL" ]; then
-            echo "::error::GRIPOFLOW_API_URL is empty or not configured."
-            exit 1
-          fi
-
-          if [ -z "$GRIPOFLOW_API_TOKEN" ]; then
-            echo "::error::GRIPOFLOW_API_TOKEN is empty or not configured."
-            exit 1
-          fi
-
-          echo "GripoFlow API configuration is present."
-
-          # ==================================================
-          # 5. Wait for GripoFlow execution
-          # ==================================================
-
-          echo ""
-          echo "Waiting for GripoFlow execution..."
-
-          EXECUTION_ID=""
-
-          for ATTEMPT in $(seq 1 30); do
-
-            echo "Checking GripoFlow executions... attempt $ATTEMPT/30"
-
-            EXECUTIONS=$(curl -sS \
-              --connect-timeout 15 \
-              --max-time 30 \
-              -H "Authorization: Bearer $GRIPOFLOW_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              "$GRIPOFLOW_API_URL")
-
-            EXECUTION_ID=$(echo "$EXECUTIONS" | jq -r \
-              --arg sha "$HEAD_SHA" '
-              if .executions then
-                [
-                  .executions[]
-                  | select(
-                      (.input.pull_request.head_sha? == $sha)
-                      or
-                      (.input.head_sha? == $sha)
-                      or
-                      (.head_sha? == $sha)
-                  )
-                ][0].id // empty
-              else
-                empty
-              end
-              ')
-
-            if [ -n "$EXECUTION_ID" ] && [ "$EXECUTION_ID" != "null" ]; then
-              echo ""
-              echo "Found GripoFlow execution:"
-              echo "$EXECUTION_ID"
-              break
-            fi
-
-            sleep 2
-
-          done
-
-          if [ -z "$EXECUTION_ID" ]; then
-            echo "::error::Could not find the GripoFlow execution."
+          if [ "$HTTP_CODE" -ge 500 ]; then
+            echo "::error::GripoFlow server error: HTTP $HTTP_CODE"
             exit 1
           fi
 
           # ==================================================
-          # 6. Poll execution until completed
+          # Parse final GripoFlow result
           # ==================================================
 
-          echo ""
-          echo "Monitoring execution: $EXECUTION_ID"
+          STATUS=$(echo "$BODY" | jq -r '
+            if .status then
+              .status
+            elif .data.status then
+              .data.status
+            else
+              empty
+            end
+          ' 2>/dev/null || true)
 
-          FINAL_EXECUTION=""
-
-          for ATTEMPT in $(seq 1 60); do
-
-            echo ""
-            echo "Polling GripoFlow... attempt $ATTEMPT/60"
-
-            EXECUTION=$(curl -sS \
-              --connect-timeout 15 \
-              --max-time 30 \
-              -H "Authorization: Bearer $GRIPOFLOW_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              "$GRIPOFLOW_API_URL/$EXECUTION_ID")
-
-            WORKFLOW_STATUS=$(echo "$EXECUTION" | jq -r '.status // empty')
-
-            echo "Workflow status: $WORKFLOW_STATUS"
-
-            if [ "$WORKFLOW_STATUS" = "completed" ]; then
-              FINAL_EXECUTION="$EXECUTION"
-              echo ""
-              echo "GripoFlow execution completed."
-              break
-            fi
-
-            if [ "$WORKFLOW_STATUS" = "failed" ]; then
-              echo "::error::GripoFlow workflow execution failed."
-              echo "$EXECUTION"
-              exit 1
-            fi
-
-            sleep 5
-
-          done
-
-          if [ -z "$FINAL_EXECUTION" ]; then
-            echo "::error::GripoFlow execution timed out."
-            exit 1
-          fi
-
-          # ==================================================
-          # 7. Read A1 result
-          # ==================================================
+          MESSAGE=$(echo "$BODY" | jq -r '
+            if .message then
+              .message
+            elif .data.message then
+              .data.message
+            else
+              empty
+            end
+          ' 2>/dev/null || true)
 
           echo ""
           echo "========================================"
-          echo "GripoFlow Gitleaks Result"
+          echo "GripoFlow Security Result"
           echo "========================================"
 
-          A1_RESULT=$(echo "$FINAL_EXECUTION" | jq -c '.activities.A1.output // empty')
-
-          if [ -z "$A1_RESULT" ] || [ "$A1_RESULT" = "null" ]; then
-            echo "::error::A1 result was not found in GripoFlow execution."
-            exit 1
-          fi
-
-          echo "A1 Result:"
-          echo "$A1_RESULT" | jq .
+          echo "Status: ${STATUS:-unknown}"
+          echo "Message: ${MESSAGE:-unknown}"
 
           # ==================================================
-          # 8. Extract security result
+          # Enforce PR gate
           # ==================================================
 
-          STATUS=$(echo "$A1_RESULT" | jq -r '.status // empty')
-          FINDINGS=$(echo "$A1_RESULT" | jq -r '.findings // 0')
-          SUMMARY=$(echo "$A1_RESULT" | jq -r '.summary // empty')
-
-          echo ""
-          echo "Security scan status: $STATUS"
-          echo "Findings: $FINDINGS"
-          echo "Summary: $SUMMARY"
-
-          # ==================================================
-          # 9. Enforce GitHub PR security gate
-          # ==================================================
-
-          if [ "$STATUS" = "failure" ]; then
-
-            echo ""
-            echo "========================================"
-            echo "SECURITY SCAN FAILED"
-            echo "========================================"
-
-            echo "::error::Gitleaks detected $FINDINGS secret(s)."
-            echo "::error::This pull request must not be merged."
-
-            echo "========================================"
-
-            exit 1
-
-          elif [ "$STATUS" = "success" ]; then
+          if [ "$STATUS" = "success" ]; then
 
             echo ""
             echo "========================================"
@@ -301,15 +164,30 @@ jobs:
             echo "No secrets detected."
             echo "PR is clear to merge."
 
+            exit 0
+
+          elif [ "$STATUS" = "failure" ]; then
+
+            echo ""
+            echo "========================================"
+            echo "SECURITY SCAN FAILED"
             echo "========================================"
 
-            exit 0
+            echo "::error::Gitleaks detected secrets."
+            echo "::error::$MESSAGE"
+            echo "::error::This pull request must not be merged."
+
+            exit 1
 
           else
 
             echo ""
-            echo "::error::Unexpected A1 security status: $STATUS"
-            echo "Failing closed for security."
+            echo "========================================"
+            echo "INVALID GRIPOFLOW RESPONSE"
+            echo "========================================"
+
+            echo "::error::GripoFlow did not return a final security result."
+            echo "::error::Status received: ${STATUS:-empty}"
 
             exit 1
 
