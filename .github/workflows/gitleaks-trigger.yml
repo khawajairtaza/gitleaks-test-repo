@@ -17,6 +17,7 @@ jobs:
       - name: Trigger GripoFlow Gitleaks Scan
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
         run: |
           set -e
@@ -27,15 +28,10 @@ jobs:
 
           PR_NUMBER="${{ github.event.pull_request.number }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          HEAD_REF="${{ github.event.pull_request.head.ref }}"
-          BASE_REF="${{ github.event.pull_request.base.ref }}"
-          REPO_URL="${{ github.event.repository.clone_url }}"
           REPO_FULL_NAME="${{ github.repository }}"
 
           echo "PR: $PR_NUMBER"
           echo "HEAD SHA: $HEAD_SHA"
-          echo "HEAD REF: $HEAD_REF"
-          echo "BASE REF: $BASE_REF"
           echo "Repository: $REPO_FULL_NAME"
 
           if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
@@ -43,12 +39,16 @@ jobs:
             exit 1
           fi
 
+          # ==================================================
+          # 1. Build payload
+          # ==================================================
+
           PAYLOAD=$(jq -n \
-            --arg clone_url "$REPO_URL" \
+            --arg clone_url "${{ github.event.repository.clone_url }}" \
             --arg full_name "$REPO_FULL_NAME" \
             --arg sha "$HEAD_SHA" \
-            --arg head_ref "$HEAD_REF" \
-            --arg base_ref "$BASE_REF" \
+            --arg head_ref "${{ github.event.pull_request.head.ref }}" \
+            --arg base_ref "${{ github.event.pull_request.base.ref }}" \
             --argjson number "$PR_NUMBER" \
             '{
               repository: {
@@ -63,6 +63,10 @@ jobs:
               }
             }')
 
+          # ==================================================
+          # 2. Trigger GripoFlow
+          # ==================================================
+
           echo ""
           echo "Sending PR data to GripoFlow..."
 
@@ -74,13 +78,6 @@ jobs:
             -H "Content-Type: application/json" \
             -H "ngrok-skip-browser-warning: true" \
             -d "$PAYLOAD")
-
-          CURL_EXIT=$?
-
-          if [ "$CURL_EXIT" -ne 0 ]; then
-            echo "::error::Failed to contact GripoFlow."
-            exit 1
-          fi
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -96,10 +93,102 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "GripoFlow workflow triggered successfully."
+          echo "GripoFlow workflow triggered."
+          echo "Waiting for GripoFlow security result..."
           echo "========================================"
-          echo ""
-          echo "GripoFlow will perform the Gitleaks scan"
-          echo "and report the result back to GitHub."
 
-          exit 0
+          # ==================================================
+          # 3. Wait for GripoFlow to update GitHub status
+          # ==================================================
+
+          MAX_ATTEMPTS=60
+          SLEEP_SECONDS=5
+
+          for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
+
+            echo ""
+            echo "Checking GitHub status..."
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS"
+
+            STATUS_JSON=$(gh api \
+              "/repos/$REPO_FULL_NAME/commits/$HEAD_SHA/status" \
+              --jq '.statuses')
+
+            GRIPO_STATUS=$(echo "$STATUS_JSON" | jq -r '
+              map(select(.context == "GripoFlow / Gitleaks"))
+              | sort_by(.created_at)
+              | last
+              | .state // empty
+            ')
+
+            DESCRIPTION=$(echo "$STATUS_JSON" | jq -r '
+              map(select(.context == "GripoFlow / Gitleaks"))
+              | sort_by(.created_at)
+              | last
+              | .description // empty
+            ')
+
+            echo "GripoFlow status: ${GRIPO_STATUS:-pending}"
+            echo "Description: ${DESCRIPTION:-Waiting for GripoFlow}"
+
+            # ==================================================
+            # SUCCESS
+            # ==================================================
+
+            if [ "$GRIPO_STATUS" = "success" ]; then
+
+              echo ""
+              echo "========================================"
+              echo "SECURITY SCAN PASSED"
+              echo "========================================"
+
+              echo "GripoFlow Gitleaks scan passed."
+              echo "No secrets detected."
+
+              exit 0
+            fi
+
+            # ==================================================
+            # FAILURE
+            # ==================================================
+
+            if [ "$GRIPO_STATUS" = "failure" ]; then
+
+              echo ""
+              echo "========================================"
+              echo "SECURITY SCAN FAILED"
+              echo "========================================"
+
+              echo "::error::GripoFlow detected secrets in this PR."
+              echo "::error::$DESCRIPTION"
+
+              exit 1
+            fi
+
+            # ==================================================
+            # ERROR
+            # ==================================================
+
+            if [ "$GRIPO_STATUS" = "error" ]; then
+
+              echo ""
+              echo "::error::GripoFlow returned an error status."
+              exit 1
+            fi
+
+            sleep "$SLEEP_SECONDS"
+
+          done
+
+          # ==================================================
+          # 4. Timeout
+          # ==================================================
+
+          echo ""
+          echo "========================================"
+          echo "GRIPOFLOW TIMEOUT"
+          echo "========================================"
+
+          echo "::error::GripoFlow did not report a final security result within the timeout period."
+
+          exit 1
