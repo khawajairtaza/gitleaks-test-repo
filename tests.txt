@@ -1,7 +1,3 @@
 HELLO I AM 
-SPIDERMAN
-a
-sdad
-asda
-adasd
-aaa
+
+slack_token = "xoxb-1234567890-1234567890-abcdefghijklmnop
