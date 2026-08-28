@@ -4,21 +4,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-
 jobs:
   gitleaks-scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger GripoFlow, Poll Execution, and Enforce Result
+      - name: Scan PR via GripoFlow and enforce result
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Send PR data to GripoFlow Webhook
           PAYLOAD=$(cat <<EOF
           {
             "repository": {
@@ -35,64 +28,24 @@ jobs:
           EOF
           )
 
-          echo "Triggering GripoFlow execution..."
-          INIT_RESPONSE=$(curl -s -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -H "ngrok-skip-browser-warning: true" \
             -d "$PAYLOAD")
 
-          echo "Initial Webhook Response: $INIT_RESPONSE"
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
-          # 2. Extract Execution ID or Execution Status URL
-          EXECUTION_ID=$(echo "$INIT_RESPONSE" | grep -o '"execution_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')
+          echo "GripoFlow response ($HTTP_CODE):"
+          echo "$BODY"
 
-          # Fallback: If no explicit execution_id returned, use head_sha or endpoint structure
-          if [ -z "$EXECUTION_ID" ]; then
-            EXECUTION_ID="${{ github.event.pull_request.head.sha }}"
-          fi
+          STATUS=$(echo "$BODY" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')
 
-          echo "GripoFlow Execution ID: $EXECUTION_ID"
-
-          # 3. Poll Execution until Completed
-          POLL_URL="${GRIPOFLOW_WEBHOOK_URL%/}/executions/${EXECUTION_ID}"
-          MAX_ATTEMPTS=30
-          ATTEMPT=0
-          FINAL_STATUS=""
-          FINAL_BODY=""
-
-          echo "Polling execution status at $POLL_URL..."
-
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            
-            RESPONSE=$(curl -s -X GET "$POLL_URL" \
-              -H "Content-Type: application/json" \
-              -H "ngrok-skip-browser-warning: true")
-
-            STATUS=$(echo "$RESPONSE" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')
-
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Current Status: '$STATUS'"
-
-            # If status is terminal (success, failure, or completed), break loop
-            if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "completed" ]; then
-              FINAL_STATUS="$STATUS"
-              FINAL_BODY="$RESPONSE"
-              break
-            fi
-
-            sleep 5
-          done
-
-          echo "RAW FINAL BODY: $FINAL_BODY"
-
-          # 4. Evaluate A1 Action Result
-          if [ "$FINAL_STATUS" = "failure" ]; then
-            echo "::error::GripoFlow / Gitleaks detected secrets in this PR. Merge blocked."
+          if [ "$STATUS" = "failure" ]; then
+            echo "::error::Gitleaks detected secrets in this PR. Merge blocked."
             exit 1
-          elif [ "$FINAL_STATUS" = "success" ] || [ "$FINAL_STATUS" = "completed" ]; then
-            echo "No secrets detected. PR clear to merge."
-            exit 0
-          else
-            echo "::error::Execution timed out or returned unexpected status: '$FINAL_STATUS'"
+          elif [ "$STATUS" != "success" ]; then
+            echo "::error::Unexpected or missing response from GripoFlow — treating as failure."
             exit 1
           fi
+
+          echo "No secrets detected. PR clear to merge."
