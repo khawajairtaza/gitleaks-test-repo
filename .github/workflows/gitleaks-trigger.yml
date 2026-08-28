@@ -41,9 +41,9 @@ jobs:
           echo "BASE REF: $BASE_REF"
           echo "Repository: $REPO_FULL_NAME"
 
-          # --------------------------------------------------
-          # 1. Send PR information to GripoFlow webhook
-          # --------------------------------------------------
+          # ==================================================
+          # 1. Build PR payload
+          # ==================================================
 
           PAYLOAD=$(cat <<EOF
           {
@@ -62,29 +62,87 @@ jobs:
           )
 
           echo ""
-          echo "Sending PR to GripoFlow..."
+          echo "PR payload created."
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
+          # ==================================================
+          # 2. Validate GripoFlow webhook configuration
+          # ==================================================
+
+          echo ""
+          echo "Checking GripoFlow webhook configuration..."
+
+          if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
+            echo "::error::GRIPOFLOW_WEBHOOK_URL is empty or not configured."
+            exit 1
+          fi
+
+          echo "Webhook URL is configured."
+
+          # ==================================================
+          # 3. Send PR data to GripoFlow
+          # ==================================================
+
+          echo ""
+          echo "Sending PR data to GripoFlow..."
+
+          set +e
+
+          RESPONSE=$(curl -sS \
+            --connect-timeout 15 \
+            --max-time 60 \
+            -w "\n%{http_code}" \
             -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "ngrok-skip-browser-warning: true" \
             -d "$PAYLOAD")
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+          CURL_EXIT=$?
 
-          echo "Webhook HTTP status: $HTTP_CODE"
-          echo "Webhook response:"
-          echo "$BODY"
+          set -e
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::error::GripoFlow webhook request failed."
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::curl failed while contacting GripoFlow."
+            echo "curl exit code: $CURL_EXIT"
             exit 1
           fi
 
-          # --------------------------------------------------
-          # 2. Wait for GripoFlow execution to appear
-          # --------------------------------------------------
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "GripoFlow HTTP status: $HTTP_CODE"
+          echo "GripoFlow response:"
+          echo "$BODY"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::GripoFlow webhook returned HTTP $HTTP_CODE."
+            exit 1
+          fi
+
+          echo ""
+          echo "GripoFlow accepted the webhook request."
+
+          # ==================================================
+          # 4. Validate API configuration
+          # ==================================================
+
+          echo ""
+          echo "Checking GripoFlow API configuration..."
+
+          if [ -z "$GRIPOFLOW_API_URL" ]; then
+            echo "::error::GRIPOFLOW_API_URL is empty or not configured."
+            exit 1
+          fi
+
+          if [ -z "$GRIPOFLOW_API_TOKEN" ]; then
+            echo "::error::GRIPOFLOW_API_TOKEN is empty or not configured."
+            exit 1
+          fi
+
+          echo "GripoFlow API configuration is present."
+
+          # ==================================================
+          # 5. Wait for GripoFlow execution
+          # ==================================================
 
           echo ""
           echo "Waiting for GripoFlow execution..."
@@ -95,7 +153,9 @@ jobs:
 
             echo "Checking GripoFlow executions... attempt $ATTEMPT/30"
 
-            EXECUTIONS=$(curl -s \
+            EXECUTIONS=$(curl -sS \
+              --connect-timeout 15 \
+              --max-time 30 \
               -H "Authorization: Bearer $GRIPOFLOW_API_TOKEN" \
               -H "Content-Type: application/json" \
               "$GRIPOFLOW_API_URL")
@@ -119,6 +179,7 @@ jobs:
               ')
 
             if [ -n "$EXECUTION_ID" ] && [ "$EXECUTION_ID" != "null" ]; then
+              echo ""
               echo "Found GripoFlow execution:"
               echo "$EXECUTION_ID"
               break
@@ -133,12 +194,12 @@ jobs:
             exit 1
           fi
 
+          # ==================================================
+          # 6. Poll execution until completed
+          # ==================================================
+
           echo ""
           echo "Monitoring execution: $EXECUTION_ID"
-
-          # --------------------------------------------------
-          # 3. Poll execution until completed
-          # --------------------------------------------------
 
           FINAL_EXECUTION=""
 
@@ -147,7 +208,9 @@ jobs:
             echo ""
             echo "Polling GripoFlow... attempt $ATTEMPT/60"
 
-            EXECUTION=$(curl -s \
+            EXECUTION=$(curl -sS \
+              --connect-timeout 15 \
+              --max-time 30 \
               -H "Authorization: Bearer $GRIPOFLOW_API_TOKEN" \
               -H "Content-Type: application/json" \
               "$GRIPOFLOW_API_URL/$EXECUTION_ID")
@@ -158,6 +221,8 @@ jobs:
 
             if [ "$WORKFLOW_STATUS" = "completed" ]; then
               FINAL_EXECUTION="$EXECUTION"
+              echo ""
+              echo "GripoFlow execution completed."
               break
             fi
 
@@ -176,9 +241,9 @@ jobs:
             exit 1
           fi
 
-          # --------------------------------------------------
-          # 4. Read A1 result
-          # --------------------------------------------------
+          # ==================================================
+          # 7. Read A1 result
+          # ==================================================
 
           echo ""
           echo "========================================"
@@ -189,16 +254,15 @@ jobs:
 
           if [ -z "$A1_RESULT" ] || [ "$A1_RESULT" = "null" ]; then
             echo "::error::A1 result was not found in GripoFlow execution."
-            echo "$FINAL_EXECUTION"
             exit 1
           fi
 
           echo "A1 Result:"
           echo "$A1_RESULT" | jq .
 
-          # --------------------------------------------------
-          # 5. Extract security status
-          # --------------------------------------------------
+          # ==================================================
+          # 8. Extract security result
+          # ==================================================
 
           STATUS=$(echo "$A1_RESULT" | jq -r '.status // empty')
           FINDINGS=$(echo "$A1_RESULT" | jq -r '.findings // 0')
@@ -209,9 +273,9 @@ jobs:
           echo "Findings: $FINDINGS"
           echo "Summary: $SUMMARY"
 
-          # --------------------------------------------------
-          # 6. Enforce GitHub PR security gate
-          # --------------------------------------------------
+          # ==================================================
+          # 9. Enforce GitHub PR security gate
+          # ==================================================
 
           if [ "$STATUS" = "failure" ]; then
 
@@ -219,8 +283,10 @@ jobs:
             echo "========================================"
             echo "SECURITY SCAN FAILED"
             echo "========================================"
+
             echo "::error::Gitleaks detected $FINDINGS secret(s)."
             echo "::error::This pull request must not be merged."
+
             echo "========================================"
 
             exit 1
@@ -231,8 +297,10 @@ jobs:
             echo "========================================"
             echo "SECURITY SCAN PASSED"
             echo "========================================"
+
             echo "No secrets detected."
             echo "PR is clear to merge."
+
             echo "========================================"
 
             exit 0
@@ -242,6 +310,7 @@ jobs:
             echo ""
             echo "::error::Unexpected A1 security status: $STATUS"
             echo "Failing closed for security."
+
             exit 1
 
           fi
