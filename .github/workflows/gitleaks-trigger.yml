@@ -4,48 +4,244 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   gitleaks-scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Scan PR via GripoFlow and enforce result
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
+          GRIPOFLOW_API_URL: ${{ secrets.GRIPOFLOW_API_URL }}
+          GRIPOFLOW_API_TOKEN: ${{ secrets.GRIPOFLOW_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
+          set -e
+
+          echo "========================================"
+          echo "Starting GripoFlow Gitleaks PR Gate"
+          echo "========================================"
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          REPO_URL="${{ github.event.repository.clone_url }}"
+          REPO_FULL_NAME="${{ github.repository }}"
+
+          echo "PR: $PR_NUMBER"
+          echo "HEAD SHA: $HEAD_SHA"
+          echo "HEAD REF: $HEAD_REF"
+          echo "BASE REF: $BASE_REF"
+          echo "Repository: $REPO_FULL_NAME"
+
+          # --------------------------------------------------
+          # 1. Send PR information to GripoFlow webhook
+          # --------------------------------------------------
+
           PAYLOAD=$(cat <<EOF
           {
             "repository": {
-              "clone_url": "${{ github.event.repository.clone_url }}",
-              "full_name": "${{ github.repository }}"
+              "clone_url": "$REPO_URL",
+              "full_name": "$REPO_FULL_NAME"
             },
             "pull_request": {
-              "number": ${{ github.event.pull_request.number }},
-              "head_sha": "${{ github.event.pull_request.head.sha }}",
-              "head_ref": "${{ github.event.pull_request.head.ref }}",
-              "base_ref": "${{ github.event.pull_request.base.ref }}"
+              "number": $PR_NUMBER,
+              "head_sha": "$HEAD_SHA",
+              "head_ref": "$HEAD_REF",
+              "base_ref": "$BASE_REF"
             }
           }
           EOF
           )
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GRIPOFLOW_WEBHOOK_URL" \
+          echo ""
+          echo "Sending PR to GripoFlow..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
+            -H "ngrok-skip-browser-warning: true" \
             -d "$PAYLOAD")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
 
-          echo "GripoFlow response ($HTTP_CODE):"
+          echo "Webhook HTTP status: $HTTP_CODE"
+          echo "Webhook response:"
           echo "$BODY"
 
-          STATUS=$(echo "$BODY" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')
-
-          if [ "$STATUS" = "failure" ]; then
-            echo "::error::Gitleaks detected secrets in this PR. Merge blocked."
-            exit 1
-          elif [ "$STATUS" != "success" ]; then
-            echo "::error::Unexpected or missing response from GripoFlow — treating as failure."
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::GripoFlow webhook request failed."
             exit 1
           fi
 
-          echo "No secrets detected. PR clear to merge."
+          # --------------------------------------------------
+          # 2. Wait for GripoFlow execution to appear
+          # --------------------------------------------------
+
+          echo ""
+          echo "Waiting for GripoFlow execution..."
+
+          EXECUTION_ID=""
+
+          for ATTEMPT in $(seq 1 30); do
+
+            echo "Checking GripoFlow executions... attempt $ATTEMPT/30"
+
+            EXECUTIONS=$(curl -s \
+              -H "Authorization: Bearer $GRIPOFLOW_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "$GRIPOFLOW_API_URL")
+
+            EXECUTION_ID=$(echo "$EXECUTIONS" | jq -r \
+              --arg sha "$HEAD_SHA" '
+              if .executions then
+                [
+                  .executions[]
+                  | select(
+                      (.input.pull_request.head_sha? == $sha)
+                      or
+                      (.input.head_sha? == $sha)
+                      or
+                      (.head_sha? == $sha)
+                  )
+                ][0].id // empty
+              else
+                empty
+              end
+              ')
+
+            if [ -n "$EXECUTION_ID" ] && [ "$EXECUTION_ID" != "null" ]; then
+              echo "Found GripoFlow execution:"
+              echo "$EXECUTION_ID"
+              break
+            fi
+
+            sleep 2
+
+          done
+
+          if [ -z "$EXECUTION_ID" ]; then
+            echo "::error::Could not find the GripoFlow execution."
+            exit 1
+          fi
+
+          echo ""
+          echo "Monitoring execution: $EXECUTION_ID"
+
+          # --------------------------------------------------
+          # 3. Poll execution until completed
+          # --------------------------------------------------
+
+          FINAL_EXECUTION=""
+
+          for ATTEMPT in $(seq 1 60); do
+
+            echo ""
+            echo "Polling GripoFlow... attempt $ATTEMPT/60"
+
+            EXECUTION=$(curl -s \
+              -H "Authorization: Bearer $GRIPOFLOW_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "$GRIPOFLOW_API_URL/$EXECUTION_ID")
+
+            WORKFLOW_STATUS=$(echo "$EXECUTION" | jq -r '.status // empty')
+
+            echo "Workflow status: $WORKFLOW_STATUS"
+
+            if [ "$WORKFLOW_STATUS" = "completed" ]; then
+              FINAL_EXECUTION="$EXECUTION"
+              break
+            fi
+
+            if [ "$WORKFLOW_STATUS" = "failed" ]; then
+              echo "::error::GripoFlow workflow execution failed."
+              echo "$EXECUTION"
+              exit 1
+            fi
+
+            sleep 5
+
+          done
+
+          if [ -z "$FINAL_EXECUTION" ]; then
+            echo "::error::GripoFlow execution timed out."
+            exit 1
+          fi
+
+          # --------------------------------------------------
+          # 4. Read A1 result
+          # --------------------------------------------------
+
+          echo ""
+          echo "========================================"
+          echo "GripoFlow Gitleaks Result"
+          echo "========================================"
+
+          A1_RESULT=$(echo "$FINAL_EXECUTION" | jq -c '.activities.A1.output // empty')
+
+          if [ -z "$A1_RESULT" ] || [ "$A1_RESULT" = "null" ]; then
+            echo "::error::A1 result was not found in GripoFlow execution."
+            echo "$FINAL_EXECUTION"
+            exit 1
+          fi
+
+          echo "A1 Result:"
+          echo "$A1_RESULT" | jq .
+
+          # --------------------------------------------------
+          # 5. Extract security status
+          # --------------------------------------------------
+
+          STATUS=$(echo "$A1_RESULT" | jq -r '.status // empty')
+          FINDINGS=$(echo "$A1_RESULT" | jq -r '.findings // 0')
+          SUMMARY=$(echo "$A1_RESULT" | jq -r '.summary // empty')
+
+          echo ""
+          echo "Security scan status: $STATUS"
+          echo "Findings: $FINDINGS"
+          echo "Summary: $SUMMARY"
+
+          # --------------------------------------------------
+          # 6. Enforce GitHub PR security gate
+          # --------------------------------------------------
+
+          if [ "$STATUS" = "failure" ]; then
+
+            echo ""
+            echo "========================================"
+            echo "SECURITY SCAN FAILED"
+            echo "========================================"
+            echo "::error::Gitleaks detected $FINDINGS secret(s)."
+            echo "::error::This pull request must not be merged."
+            echo "========================================"
+
+            exit 1
+
+          elif [ "$STATUS" = "success" ]; then
+
+            echo ""
+            echo "========================================"
+            echo "SECURITY SCAN PASSED"
+            echo "========================================"
+            echo "No secrets detected."
+            echo "PR is clear to merge."
+            echo "========================================"
+
+            exit 0
+
+          else
+
+            echo ""
+            echo "::error::Unexpected A1 security status: $STATUS"
+            echo "Failing closed for security."
+            exit 1
+
+          fi
