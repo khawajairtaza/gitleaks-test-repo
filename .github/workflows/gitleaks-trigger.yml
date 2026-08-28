@@ -7,14 +7,14 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: write
+  statuses: write
 
 jobs:
   gitleaks-scan:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Scan PR via GripoFlow
+      - name: Trigger GripoFlow Gitleaks Scan
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
 
@@ -38,14 +38,15 @@ jobs:
           echo "BASE REF: $BASE_REF"
           echo "Repository: $REPO_FULL_NAME"
 
-          # ==================================================
-          # Build PR payload
-          # ==================================================
+          if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
+            echo "::error::GRIPOFLOW_WEBHOOK_URL is not configured."
+            exit 1
+          fi
 
           PAYLOAD=$(jq -n \
             --arg clone_url "$REPO_URL" \
             --arg full_name "$REPO_FULL_NAME" \
-            --arg head_sha "$HEAD_SHA" \
+            --arg sha "$HEAD_SHA" \
             --arg head_ref "$HEAD_REF" \
             --arg base_ref "$BASE_REF" \
             --argjson number "$PR_NUMBER" \
@@ -56,37 +57,18 @@ jobs:
               },
               pull_request: {
                 number: $number,
-                head_sha: $head_sha,
+                head_sha: $sha,
                 head_ref: $head_ref,
                 base_ref: $base_ref
               }
-            }'
-          )
-
-          echo ""
-          echo "PR payload created."
-
-          # ==================================================
-          # Validate webhook
-          # ==================================================
-
-          if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
-            echo "::error::GRIPOFLOW_WEBHOOK_URL is not configured."
-            exit 1
-          fi
-
-          echo "Webhook URL is configured."
-
-          # ==================================================
-          # Send request to GripoFlow
-          # ==================================================
+            }')
 
           echo ""
           echo "Sending PR data to GripoFlow..."
 
           RESPONSE=$(curl -sS \
             --connect-timeout 15 \
-            --max-time 300 \
+            --max-time 60 \
             -w "\n%{http_code}" \
             -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
@@ -97,98 +79,27 @@ jobs:
 
           if [ "$CURL_EXIT" -ne 0 ]; then
             echo "::error::Failed to contact GripoFlow."
-            echo "curl exit code: $CURL_EXIT"
             exit 1
           fi
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
 
-          echo ""
           echo "GripoFlow HTTP status: $HTTP_CODE"
           echo "GripoFlow response:"
           echo "$BODY"
 
-          # ==================================================
-          # Validate HTTP response
-          # ==================================================
-
-          if [ "$HTTP_CODE" -ge 500 ]; then
-            echo "::error::GripoFlow server error: HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::GripoFlow webhook returned HTTP $HTTP_CODE."
             exit 1
           fi
-
-          # ==================================================
-          # Parse final GripoFlow result
-          # ==================================================
-
-          STATUS=$(echo "$BODY" | jq -r '
-            if .status then
-              .status
-            elif .data.status then
-              .data.status
-            else
-              empty
-            end
-          ' 2>/dev/null || true)
-
-          MESSAGE=$(echo "$BODY" | jq -r '
-            if .message then
-              .message
-            elif .data.message then
-              .data.message
-            else
-              empty
-            end
-          ' 2>/dev/null || true)
 
           echo ""
           echo "========================================"
-          echo "GripoFlow Security Result"
+          echo "GripoFlow workflow triggered successfully."
           echo "========================================"
+          echo ""
+          echo "GripoFlow will perform the Gitleaks scan"
+          echo "and report the result back to GitHub."
 
-          echo "Status: ${STATUS:-unknown}"
-          echo "Message: ${MESSAGE:-unknown}"
-
-          # ==================================================
-          # Enforce PR gate
-          # ==================================================
-
-          if [ "$STATUS" = "success" ]; then
-
-            echo ""
-            echo "========================================"
-            echo "SECURITY SCAN PASSED"
-            echo "========================================"
-
-            echo "No secrets detected."
-            echo "PR is clear to merge."
-
-            exit 0
-
-          elif [ "$STATUS" = "failure" ]; then
-
-            echo ""
-            echo "========================================"
-            echo "SECURITY SCAN FAILED"
-            echo "========================================"
-
-            echo "::error::Gitleaks detected secrets."
-            echo "::error::$MESSAGE"
-            echo "::error::This pull request must not be merged."
-
-            exit 1
-
-          else
-
-            echo ""
-            echo "========================================"
-            echo "INVALID GRIPOFLOW RESPONSE"
-            echo "========================================"
-
-            echo "::error::GripoFlow did not return a final security result."
-            echo "::error::Status received: ${STATUS:-empty}"
-
-            exit 1
-
-          fi
+          exit 0
