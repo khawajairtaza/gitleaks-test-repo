@@ -39,10 +39,6 @@ jobs:
             exit 1
           fi
 
-          # ==================================================
-          # 1. Build payload
-          # ==================================================
-
           PAYLOAD=$(jq -n \
             --arg clone_url "${{ github.event.repository.clone_url }}" \
             --arg full_name "$REPO_FULL_NAME" \
@@ -63,10 +59,6 @@ jobs:
               }
             }')
 
-          # ==================================================
-          # 2. Trigger GripoFlow
-          # ==================================================
-
           echo ""
           echo "Sending PR data to GripoFlow..."
 
@@ -76,7 +68,6 @@ jobs:
             -w "\n%{http_code}" \
             -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -H "ngrok-skip-browser-warning: true" \
             -d "$PAYLOAD")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
@@ -96,10 +87,6 @@ jobs:
           echo "GripoFlow workflow triggered."
           echo "Waiting for GripoFlow security result..."
           echo "========================================"
-
-          # ==================================================
-          # 3. Wait for GripoFlow to update GitHub status
-          # ==================================================
 
           MAX_ATTEMPTS=60
           SLEEP_SECONDS=5
@@ -131,64 +118,38 @@ jobs:
             echo "GripoFlow status: ${GRIPO_STATUS:-pending}"
             echo "Description: ${DESCRIPTION:-Waiting for GripoFlow}"
 
-            # ==================================================
-            # SUCCESS
-            # ==================================================
-
             if [ "$GRIPO_STATUS" = "success" ]; then
-
               echo ""
               echo "========================================"
               echo "SECURITY SCAN PASSED"
               echo "========================================"
-
               echo "GripoFlow Gitleaks scan passed."
               echo "No secrets detected."
-
               exit 0
             fi
 
-            # ==================================================
-            # FAILURE
-            # ==================================================
-
             if [ "$GRIPO_STATUS" = "failure" ]; then
-
               echo ""
               echo "========================================"
               echo "SECURITY SCAN FAILED"
               echo "========================================"
-
               echo "::error::GripoFlow detected secrets in this PR."
               echo "::error::$DESCRIPTION"
-
               exit 1
             fi
 
-            # ==================================================
-            # ERROR
-            # ==================================================
-
             if [ "$GRIPO_STATUS" = "error" ]; then
-
               echo ""
               echo "::error::GripoFlow returned an error status."
               exit 1
             fi
 
             sleep "$SLEEP_SECONDS"
-
           done
-
-          # ==================================================
-          # 4. Timeout
-          # ==================================================
 
           echo ""
           echo "========================================"
           echo "GRIPOFLOW TIMEOUT"
           echo "========================================"
-
           echo "::error::GripoFlow did not report a final security result within the timeout period."
-
           exit 1
