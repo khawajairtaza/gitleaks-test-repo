@@ -17,6 +17,8 @@ jobs:
       - name: Trigger GripoFlow Gitleaks Scan
         env:
           GRIPOFLOW_WEBHOOK_URL: ${{ secrets.GRIPOFLOW_WEBHOOK_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
         run: |
@@ -36,6 +38,16 @@ jobs:
 
           if [ -z "$GRIPOFLOW_WEBHOOK_URL" ]; then
             echo "::error::GRIPOFLOW_WEBHOOK_URL is not configured."
+            exit 1
+          fi
+
+          if [ -z "$CF_ACCESS_CLIENT_ID" ]; then
+            echo "::error::CF_ACCESS_CLIENT_ID is not configured."
+            exit 1
+          fi
+
+          if [ -z "$CF_ACCESS_CLIENT_SECRET" ]; then
+            echo "::error::CF_ACCESS_CLIENT_SECRET is not configured."
             exit 1
           fi
 
@@ -68,6 +80,8 @@ jobs:
             -w "\n%{http_code}" \
             -X POST "$GRIPOFLOW_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
+            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
             -d "$PAYLOAD")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
