@@ -1,7 +1,3 @@
-# Gitleaks test data - intentionally fake
-
-# Gitleaks test data - intentionally fake
-
 STRIPE_TEST_TOKEN=sk_test_51H6fxxxxxxxxxxxxxxxxxxxxxxxx
 SLACK_TEST_TOKEN=xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx
 
