@@ -1,4 +1,4 @@
-﻿GripoFlow workflow trigger test
+ workflow trigger test
 # Gitleaks test secrets
 # These are intentionally fake/test values for scanner testing only.
 
